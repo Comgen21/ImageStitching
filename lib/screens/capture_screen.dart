@@ -358,10 +358,10 @@ class _FullscreenCamera extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final size = MediaQuery.of(context).size;
-    final scale =
-        1.0 / (controller.value.aspectRatio * size.aspectRatio);
+    var scale = size.aspectRatio * controller.value.aspectRatio;
+    if (scale < 1) scale = 1 / scale;
     return Transform.scale(
-      scale: scale < 1 ? 1.0 / scale : scale,
+      scale: scale,
       alignment: Alignment.center,
       child: CameraPreview(controller),
     );

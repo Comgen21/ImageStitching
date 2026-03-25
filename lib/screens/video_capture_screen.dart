@@ -71,6 +71,16 @@ class _VideoCaptureScreenState extends State<VideoCaptureScreen> {
     setState(() => _isRecording = true);
   }
 
+  /// Stops recording and discards the video — used by the back button.
+  Future<void> _cancelRecording() async {
+    if (!_isRecording || _controller == null) return;
+    _timer?.cancel();
+    try {
+      await _controller!.stopVideoRecording();
+    } catch (_) {}
+    if (mounted) setState(() => _isRecording = false);
+  }
+
   Future<void> _stopAndProcess() async {
     if (!_isRecording || _controller == null) return;
 
@@ -242,9 +252,9 @@ class _VideoCaptureScreenState extends State<VideoCaptureScreen> {
         children: [
           IconButton(
             icon: const Icon(Icons.arrow_back, color: Colors.white),
-            onPressed: () {
-              if (_isRecording) _stopAndProcess();
-              Navigator.pop(context);
+            onPressed: () async {
+              if (_isRecording) await _cancelRecording();
+              if (mounted) Navigator.pop(context);
             },
           ),
           const Expanded(
@@ -366,9 +376,11 @@ class _FullscreenCamera extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final size = MediaQuery.of(context).size;
-    final scale = 1.0 / (controller.value.aspectRatio * size.aspectRatio);
+    // Multiply both aspect ratios — if result < 1 invert so we always scale up
+    var scale = size.aspectRatio * controller.value.aspectRatio;
+    if (scale < 1) scale = 1 / scale;
     return Transform.scale(
-      scale: scale < 1 ? 1.0 / scale : scale,
+      scale: scale,
       alignment: Alignment.center,
       child: CameraPreview(controller),
     );
