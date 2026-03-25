@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
+import '../widgets/focus_indicator.dart';
 import '../services/stitch_service.dart';
 import 'panorama_screen.dart';
 
@@ -20,6 +21,7 @@ class _VideoCaptureScreenState extends State<VideoCaptureScreen> {
   int _recordSeconds = 0;
   Timer? _timer;
   String? _processingStatus;
+  Offset? _focusPoint;
 
   @override
   void initState() {
@@ -110,6 +112,26 @@ class _VideoCaptureScreenState extends State<VideoCaptureScreen> {
     }
   }
 
+  Future<void> _onTapFocus(TapDownDetails details) async {
+    if (_controller == null || !_initialized || _isProcessing) return;
+
+    final size = MediaQuery.of(context).size;
+    final x = (details.localPosition.dx / size.width).clamp(0.0, 1.0);
+    final y = (details.localPosition.dy / size.height).clamp(0.0, 1.0);
+
+    setState(() => _focusPoint = details.localPosition);
+
+    try {
+      await _controller!.setFocusMode(FocusMode.auto);
+      await _controller!.setFocusPoint(Offset(x, y));
+      // Only adjust exposure when not recording (exposure is locked during recording)
+      if (!_isRecording) {
+        await _controller!.setExposureMode(ExposureMode.auto);
+        await _controller!.setExposurePoint(Offset(x, y));
+      }
+    } catch (_) {}
+  }
+
   String get _timerText {
     final m = (_recordSeconds ~/ 60).toString().padLeft(2, '0');
     final s = (_recordSeconds % 60).toString().padLeft(2, '0');
@@ -124,12 +146,26 @@ class _VideoCaptureScreenState extends State<VideoCaptureScreen> {
         child: Stack(
           fit: StackFit.expand,
           children: [
-            // Camera preview
+            // Camera preview + tap-to-focus
             if (_initialized && _controller != null)
-              _FullscreenCamera(controller: _controller!)
+              TapToFocusHandler(
+                onTap: _onTapFocus,
+                child: _FullscreenCamera(controller: _controller!),
+              )
             else
               const Center(
                   child: CircularProgressIndicator(color: Color(0xFF1A73E8))),
+
+            // Focus indicator
+            if (_focusPoint != null)
+              Positioned(
+                left: _focusPoint!.dx - 34,
+                top: _focusPoint!.dy - 34,
+                child: FocusIndicator(
+                  key: ValueKey(_focusPoint),
+                  onDismiss: () => setState(() => _focusPoint = null),
+                ),
+              ),
 
             // Processing overlay
             if (_isProcessing)

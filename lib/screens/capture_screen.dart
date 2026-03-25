@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import '../widgets/dot_guide.dart';
+import '../widgets/focus_indicator.dart';
 import '../services/stitch_service.dart';
 import 'panorama_screen.dart';
 
@@ -28,6 +29,7 @@ class _CaptureScreenState extends State<CaptureScreen> {
   bool _autoMode = false;
   bool _showFlash = false;
   final List<String> _frames = [];
+  Offset? _focusPoint;
 
   // Gyroscope for auto-capture
   StreamSubscription<GyroscopeEvent>? _gyroSub;
@@ -71,6 +73,30 @@ class _CaptureScreenState extends State<CaptureScreen> {
       });
     } catch (e) {
       debugPrint('Camera init error: $e');
+    }
+  }
+
+  // ── Tap-to-focus ─────────────────────────────────────────────────────────
+
+  Future<void> _onTapFocus(TapDownDetails details) async {
+    if (_controller == null || !_initialized || _isProcessing) return;
+
+    final size = MediaQuery.of(context).size;
+    final x = (details.localPosition.dx / size.width).clamp(0.0, 1.0);
+    final y = (details.localPosition.dy / size.height).clamp(0.0, 1.0);
+
+    setState(() => _focusPoint = details.localPosition);
+
+    try {
+      await _controller!.setFocusMode(FocusMode.auto);
+      await _controller!.setFocusPoint(Offset(x, y));
+      // Also set exposure at the same point (unless exposure is locked for auto-capture)
+      if (!_autoMode) {
+        await _controller!.setExposureMode(ExposureMode.auto);
+        await _controller!.setExposurePoint(Offset(x, y));
+      }
+    } catch (_) {
+      // Some devices don't support manual focus point — fail silently
     }
   }
 
@@ -225,12 +251,26 @@ class _CaptureScreenState extends State<CaptureScreen> {
         child: Stack(
           fit: StackFit.expand,
           children: [
-            // Camera preview
+            // Camera preview + tap-to-focus
             if (_initialized && _controller != null)
-              _FullscreenCamera(controller: _controller!)
+              TapToFocusHandler(
+                onTap: _onTapFocus,
+                child: _FullscreenCamera(controller: _controller!),
+              )
             else
               const Center(
                   child: CircularProgressIndicator(color: Color(0xFF1A73E8))),
+
+            // Focus indicator
+            if (_focusPoint != null)
+              Positioned(
+                left: _focusPoint!.dx - 34,
+                top: _focusPoint!.dy - 34,
+                child: FocusIndicator(
+                  key: ValueKey(_focusPoint),
+                  onDismiss: () => setState(() => _focusPoint = null),
+                ),
+              ),
 
             // Capture flash
             if (_showFlash)
