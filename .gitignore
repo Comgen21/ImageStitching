@@ -45,3 +45,6 @@ app.*.map.json
 /android/app/release
 
 /android/build/
+
+# OpenCV Android SDK (large binary — run setup_opencv_android.bat to download)
+OpenCV-android-sdk/

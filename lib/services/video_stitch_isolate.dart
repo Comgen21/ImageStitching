@@ -1,10 +1,11 @@
 import 'package:opencv_dart/opencv.dart';
+import 'professional_stitch_isolate.dart';
 
-/// Extracts keyframes from a video and stitches them into a panorama.
+/// Extracts keyframes from a video and stitches them into a panorama
+/// using the cylindrical-warp + SIFT + affine pipeline.
 /// Runs synchronously — call via compute() from StitchService.
 class VideoStitchIsolate {
-  // Target number of frames to stitch (balance quality vs speed)
-  static const int _targetFrames = 22;
+  static const int _targetFrames = 16;
 
   static Map<String, dynamic> run(Map<String, dynamic> params) {
     final String videoPath = params['videoPath'] as String;
@@ -22,39 +23,40 @@ class VideoStitchIsolate {
 
       if (totalFrames < 10) {
         cap.release();
-        return {'success': false, 'error': 'Video too short (only $totalFrames frames)'};
+        return {
+          'success': false,
+          'error': 'Video too short ($totalFrames frames)',
+        };
       }
 
-      // Skip first/last 8% to avoid camera shake at start and stop
+      // Skip first/last 8% to avoid shake at start and stop
       final skipStart = (totalFrames * 0.08).toInt();
-      final skipEnd = (totalFrames * 0.08).toInt();
-      final usableFrames = totalFrames - skipStart - skipEnd;
+      final usableFrames =
+          totalFrames - skipStart - (totalFrames * 0.08).toInt();
 
       if (usableFrames < 10) {
         cap.release();
-        return {'success': false, 'error': 'Video too short after trimming edges'};
+        return {
+          'success': false,
+          'error': 'Video too short after trimming edges',
+        };
       }
 
-      // Sample interval to hit target frame count
-      final step = (usableFrames ~/ _targetFrames).clamp(1, usableFrames);
-
+      // Compute evenly-spaced seek positions
+      final step = usableFrames / _targetFrames;
       final List<Mat> frames = [];
-      int idx = 0;
 
-      while (frames.length < _targetFrames) {
+      for (int i = 0; i < _targetFrames; i++) {
+        final frameIdx = skipStart + (i * step).round();
+        cap.set(CAP_PROP_POS_FRAMES, frameIdx.toDouble());
         final (success, frame) = cap.read();
-        if (!success) break;
-
-        if (idx >= skipStart) {
-          final usableIdx = idx - skipStart;
-          if (usableIdx % step == 0) {
-            frames.add(frame.clone());
-          }
+        if (!success || frame.isEmpty) {
+          frame.dispose();
+          continue;
         }
+        frames.add(frame.clone());
         frame.dispose();
-        idx++;
       }
-
       cap.release();
 
       if (frames.length < 2) {
@@ -66,53 +68,22 @@ class VideoStitchIsolate {
         };
       }
 
-      // Stitch with optimised settings
-      final stitcher = Stitcher.create(mode: StitcherMode.PANORAMA);
-      stitcher.registrationResol = 0.6;
-      stitcher.seamEstimationResol = 0.1;
-      stitcher.waveCorrection = true;
-      stitcher.panoConfidenceThresh = 1.0;
-
-      final (status, dst) = stitcher.stitch(frames.cvd);
+      // Cylindrical warp + SIFT + affine stitching
+      final result = ProfessionalStitchIsolate.runFrames(frames, outputDir);
       for (final f in frames) f.dispose();
 
-      if (status != StitcherStatus.OK) {
-        dst.dispose();
-        return {'success': false, 'error': _statusMessage(status)};
+      // Append video metadata to result
+      if (result['success'] == true) {
+        return {
+          ...result,
+          'totalFrames': totalFrames,
+          'fps': fps,
+        };
       }
-
-      final outputPath =
-          '$outputDir/panorama_${DateTime.now().millisecondsSinceEpoch}.jpeg';
-      imwrite(outputPath, dst);
-      dst.dispose();
-
-      return {
-        'success': true,
-        'filePath': outputPath,
-        'framesUsed': frames.length,
-        'totalFrames': totalFrames,
-        'fps': fps,
-      };
+      return result;
     } catch (e) {
       cap?.release();
       return {'success': false, 'error': e.toString()};
-    }
-  }
-
-  static String _statusMessage(StitcherStatus status) {
-    switch (status) {
-      case StitcherStatus.ERR_NEED_MORE_IMGS:
-        return 'Not enough overlapping frames. '
-            'Pan the shelf more slowly so frames overlap.';
-      case StitcherStatus.ERR_HOMOGRAPHY_EST_FAIL:
-        return 'Cannot match frames. '
-            'Keep the camera steady at shelf height and pan slowly.';
-      case StitcherStatus.ERR_CAMERA_PARAMS_ADJUST_FAIL:
-        return 'Camera calibration failed. '
-            'Try recording again with a steadier hand.';
-      default:
-        return 'Stitching failed ($status). '
-            'Try panning more slowly with good shelf lighting.';
     }
   }
 }

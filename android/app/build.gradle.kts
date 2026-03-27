@@ -1,3 +1,18 @@
+import java.util.Properties
+
+// ── Read local.properties ─────────────────────────────────────────────────────
+val localProperties = Properties()
+val localPropertiesFile = rootProject.file("local.properties")
+if (localPropertiesFile.exists()) {
+    localPropertiesFile.inputStream().use { localProperties.load(it) }
+}
+
+// Resolve OpenCV SDK path: prefer local.properties, fall back to a sibling dir
+val opencvSdkPath: String =
+    (localProperties.getProperty("opencv.sdk.path")
+        ?: "${rootDir}/../OpenCV-android-sdk")
+        .replace("\\", "/")  // normalise Windows back-slashes
+
 plugins {
     id("com.android.application")
     id("kotlin-android")
@@ -28,6 +43,29 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+
+        // ── NDK ABI filter ──────────────────────────────────────────────────
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
+
+        // ── CMake / NDK build arguments ─────────────────────────────────────
+        externalNativeBuild {
+            cmake {
+                cppFlags += listOf("-std=c++17", "-frtti", "-fexceptions")
+                arguments(
+                    "-DOPENCV_SDK_PATH=$opencvSdkPath"
+                )
+            }
+        }
+    }
+
+    // ── Point to the CMakeLists.txt ───────────────────────────────────────────
+    externalNativeBuild {
+        cmake {
+            path = file("CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     buildTypes {
@@ -41,4 +79,8 @@ android {
 
 flutter {
     source = "../.."
+}
+
+dependencies {
+    implementation("androidx.exifinterface:exifinterface:1.3.7")
 }

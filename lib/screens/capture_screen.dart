@@ -5,9 +5,11 @@ import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:sensors_plus/sensors_plus.dart';
+import 'package:flutter/foundation.dart';
 import '../widgets/dot_guide.dart';
 import '../widgets/focus_indicator.dart';
 import '../services/stitch_service.dart';
+import '../services/frame_analysis_isolate.dart';
 import 'panorama_screen.dart';
 
 // Auto-capture: one frame per 15° of pan rotation
@@ -31,22 +33,43 @@ class _CaptureScreenState extends State<CaptureScreen> {
   final List<String> _frames = [];
   Offset? _focusPoint;
 
-  // Gyroscope for auto-capture
-  StreamSubscription<GyroscopeEvent>? _gyroSub;
+  // Single broadcast gyro stream shared by auto-capture and DotGuide
+  late final StreamController<GyroscopeEvent> _gyroController;
+  StreamSubscription<GyroscopeEvent>? _rawGyroSub;
+  StreamSubscription<GyroscopeEvent>? _autoCaptSub;
   DateTime? _lastGyroTime;
   double _rotationSinceCapture = 0;
+
+  // DotGuide key for programmatic reset
+  final _dotGuideKey = GlobalKey<DotGuideWidgetState>();
+
+  // Frame analysis results
+  bool _isAnalyzing = false;
+  double? _overlapPercent;    // shown after each capture
+  bool _lastFrameBlurry = false;
+
+  // Exposure offset
+  double _exposureOffset = 0.0;
+  double _minExposure = -2.0;
+  double _maxExposure = 2.0;
 
   // ── Lifecycle ────────────────────────────────────────────────────────────
 
   @override
   void initState() {
     super.initState();
+    _gyroController = StreamController<GyroscopeEvent>.broadcast();
+    _rawGyroSub = gyroscopeEventStream(
+      samplingPeriod: SensorInterval.uiInterval,
+    ).listen((e) => _gyroController.add(e), onError: (_) {});
     _initCamera();
   }
 
   @override
   void dispose() {
-    _gyroSub?.cancel();
+    _autoCaptSub?.cancel();
+    _rawGyroSub?.cancel();
+    _gyroController.close();
     _controller?.dispose();
     super.dispose();
   }
@@ -60,16 +83,24 @@ class _CaptureScreenState extends State<CaptureScreen> {
 
       final ctrl = CameraController(
         cameras[0],
-        ResolutionPreset.veryHigh, // 1080p for better feature matching
+        ResolutionPreset.veryHigh,
         enableAudio: false,
         imageFormatGroup: ImageFormatGroup.jpeg,
       );
       await ctrl.initialize();
       if (!mounted) return;
 
+      double minExp = -2.0, maxExp = 2.0;
+      try {
+        minExp = await ctrl.getMinExposureOffset();
+        maxExp = await ctrl.getMaxExposureOffset();
+      } catch (_) {}
+
       setState(() {
         _controller = ctrl;
         _initialized = true;
+        _minExposure = minExp;
+        _maxExposure = maxExp;
       });
     } catch (e) {
       debugPrint('Camera init error: $e');
@@ -90,14 +121,20 @@ class _CaptureScreenState extends State<CaptureScreen> {
     try {
       await _controller!.setFocusMode(FocusMode.auto);
       await _controller!.setFocusPoint(Offset(x, y));
-      // Also set exposure at the same point (unless exposure is locked for auto-capture)
       if (!_autoMode) {
         await _controller!.setExposureMode(ExposureMode.auto);
         await _controller!.setExposurePoint(Offset(x, y));
       }
-    } catch (_) {
-      // Some devices don't support manual focus point — fail silently
-    }
+    } catch (_) {}
+  }
+
+  // ── Exposure ─────────────────────────────────────────────────────────────
+
+  Future<void> _setExposureOffset(double value) async {
+    setState(() => _exposureOffset = value);
+    try {
+      await _controller?.setExposureOffset(value);
+    } catch (_) {}
   }
 
   // ── Auto-capture mode ────────────────────────────────────────────────────
@@ -111,9 +148,7 @@ class _CaptureScreenState extends State<CaptureScreen> {
     // Lock exposure so all frames have the same brightness
     _controller?.setExposureMode(ExposureMode.locked);
 
-    _gyroSub = gyroscopeEventStream(
-      samplingPeriod: SensorInterval.uiInterval,
-    ).listen((event) {
+    _autoCaptSub = _gyroController.stream.listen((event) {
       if (!_autoMode || !mounted) return;
       final now = DateTime.now();
       if (_lastGyroTime != null) {
@@ -129,13 +164,13 @@ class _CaptureScreenState extends State<CaptureScreen> {
 
     setState(() => _autoMode = true);
 
-    // Snap first frame immediately when auto starts
+    // Snap first frame immediately
     _captureFrame();
   }
 
   void _stopAuto() {
-    _gyroSub?.cancel();
-    _gyroSub = null;
+    _autoCaptSub?.cancel();
+    _autoCaptSub = null;
     _controller?.setExposureMode(ExposureMode.auto);
     setState(() {
       _autoMode = false;
@@ -148,19 +183,62 @@ class _CaptureScreenState extends State<CaptureScreen> {
   Future<void> _captureFrame() async {
     if (!_initialized || _isCapturing || _isProcessing || _controller == null) return;
     setState(() => _isCapturing = true);
-
     _triggerFlash();
 
     try {
       final XFile photo = await _controller!.takePicture();
       final dir = await getTemporaryDirectory();
-      final dest = '${dir.path}/shelf_${DateTime.now().millisecondsSinceEpoch}.jpg';
+      final dest =
+          '${dir.path}/shelf_${DateTime.now().millisecondsSinceEpoch}.jpg';
       await File(photo.path).copy(dest);
-      if (mounted) setState(() => _frames.add(dest));
+
+      if (!mounted) return;
+
+      // Run blur + overlap analysis in isolate (non-blocking)
+      setState(() => _isAnalyzing = true);
+      final prevPath = _frames.isNotEmpty ? _frames.last : null;
+      final analysis = await compute(FrameAnalysisIsolate.run, {
+        'newPath': dest,
+        'prevPath': prevPath,
+      });
+
+      if (!mounted) return;
+
+      final isBlurry = analysis['isBlurry'] as bool;
+      final overlapPct = analysis['overlapPercent'] as double?;
+
+      if (isBlurry) {
+        // Discard blurry frame — don't add to list
+        setState(() {
+          _isAnalyzing = false;
+          _lastFrameBlurry = true;
+          _overlapPercent = null;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Frame too blurry — hold steady and try again'),
+            backgroundColor: Color(0xFFEF4444),
+            duration: Duration(seconds: 2),
+          ),
+        );
+      } else {
+        setState(() {
+          _frames.add(dest);
+          _isAnalyzing = false;
+          _lastFrameBlurry = false;
+          _overlapPercent = overlapPct;
+        });
+        // Hide the overlap badge after 3 seconds
+        Future.delayed(const Duration(seconds: 3), () {
+          if (mounted) setState(() => _overlapPercent = null);
+        });
+      }
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Capture failed: $e'), backgroundColor: Colors.red),
+          SnackBar(
+              content: Text('Capture failed: $e'),
+              backgroundColor: Colors.red),
         );
       }
     } finally {
@@ -181,7 +259,6 @@ class _CaptureScreenState extends State<CaptureScreen> {
     if (_frames.length < 2 || _isProcessing) return;
     if (_autoMode) _stopAuto();
 
-    // Warn when very few frames captured
     if (_frames.length < 5 && mounted) {
       final go = await showDialog<bool>(
         context: context,
@@ -238,7 +315,12 @@ class _CaptureScreenState extends State<CaptureScreen> {
 
   void _reset() {
     if (_autoMode) _stopAuto();
-    setState(() => _frames.clear());
+    _dotGuideKey.currentState?.reset();
+    setState(() {
+      _frames.clear();
+      _overlapPercent = null;
+      _lastFrameBlurry = false;
+    });
   }
 
   // ── Build ────────────────────────────────────────────────────────────────
@@ -281,6 +363,20 @@ class _CaptureScreenState extends State<CaptureScreen> {
             // Processing overlay
             if (_isProcessing) _buildProcessingOverlay(),
 
+            // Exposure slider — right edge, between top bar and bottom controls
+            if (!_isProcessing && _initialized)
+              Positioned(
+                right: 12,
+                top: 80,
+                bottom: 180,
+                child: _ExposureSlider(
+                  value: _exposureOffset,
+                  min: _minExposure,
+                  max: _maxExposure,
+                  onChanged: _setExposureOffset,
+                ),
+              ),
+
             // Top bar
             if (!_isProcessing)
               Positioned(
@@ -297,20 +393,67 @@ class _CaptureScreenState extends State<CaptureScreen> {
                 ),
               ),
 
-            // Bottom controls
+            // Overlap / analyzing badge — centred above the dot guide
+            if (!_isProcessing)
+              Positioned(
+                bottom: 170,
+                left: 0,
+                right: 0,
+                child: Center(
+                  child: _isAnalyzing
+                      ? Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 14, vertical: 6),
+                          decoration: BoxDecoration(
+                            color: Colors.black54,
+                            borderRadius: BorderRadius.circular(20),
+                          ),
+                          child: const Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              SizedBox(
+                                width: 12,
+                                height: 12,
+                                child: CircularProgressIndicator(
+                                    color: Colors.white70, strokeWidth: 2),
+                              ),
+                              SizedBox(width: 8),
+                              Text('Analysing...',
+                                  style: TextStyle(
+                                      color: Colors.white70, fontSize: 12)),
+                            ],
+                          ),
+                        )
+                      : _overlapPercent != null
+                          ? _OverlapBadge(percent: _overlapPercent!)
+                          : const SizedBox.shrink(),
+                ),
+              ),
+
+            // Bottom: dot guide + controls
             if (!_isProcessing)
               Positioned(
                 bottom: 0,
                 left: 0,
                 right: 0,
-                child: _BottomControls(
-                  frameCount: _frames.length,
-                  isCapturing: _isCapturing,
-                  autoMode: _autoMode,
-                  onCapture: _captureFrame,
-                  onToggleAuto: _toggleAuto,
-                  onStitch: _frames.length >= 2 ? _stitch : null,
-                  onReset: _frames.isNotEmpty ? _reset : null,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    DotGuideWidget(
+                      key: _dotGuideKey,
+                      gyroStream: _gyroController.stream,
+                      totalDots: 7,
+                    ),
+                    _BottomControls(
+                      frameCount: _frames.length,
+                      isCapturing: _isCapturing,
+                      autoMode: _autoMode,
+                      onCapture: _captureFrame,
+                      onToggleAuto: _toggleAuto,
+                      onStitch: _frames.length >= 2 ? _stitch : null,
+                      onReset: _frames.isNotEmpty ? _reset : null,
+                    ),
+                  ],
                 ),
               ),
           ],
@@ -345,6 +488,63 @@ class _CaptureScreenState extends State<CaptureScreen> {
           ],
         ),
       ),
+    );
+  }
+}
+
+// ── Exposure slider ─────────────────────────────────────────────────────────
+
+class _ExposureSlider extends StatelessWidget {
+  final double value;
+  final double min;
+  final double max;
+  final ValueChanged<double> onChanged;
+
+  const _ExposureSlider({
+    required this.value,
+    required this.min,
+    required this.max,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final label = value >= 0
+        ? '+${value.toStringAsFixed(1)}'
+        : value.toStringAsFixed(1);
+    return Column(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        const Icon(Icons.wb_sunny_outlined, color: Colors.white54, size: 16),
+        const SizedBox(height: 4),
+        Expanded(
+          child: RotatedBox(
+            quarterTurns: 3,
+            child: SliderTheme(
+              data: SliderTheme.of(context).copyWith(
+                trackHeight: 2,
+                thumbShape:
+                    const RoundSliderThumbShape(enabledThumbRadius: 6),
+                overlayShape:
+                    const RoundSliderOverlayShape(overlayRadius: 12),
+                activeTrackColor: Colors.white70,
+                inactiveTrackColor: Colors.white24,
+                thumbColor: Colors.white,
+                overlayColor: Colors.white24,
+              ),
+              child: Slider(
+                value: value.clamp(min, max),
+                min: min,
+                max: max,
+                onChanged: onChanged,
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(label,
+            style: const TextStyle(color: Colors.white54, fontSize: 10)),
+      ],
     );
   }
 }
@@ -404,7 +604,6 @@ class _TopBar extends StatelessWidget {
                     fontSize: 16,
                     fontWeight: FontWeight.bold)),
           ),
-          // Frame count badge
           AnimatedContainer(
             duration: const Duration(milliseconds: 200),
             margin: const EdgeInsets.only(right: 12),
@@ -414,7 +613,7 @@ class _TopBar extends StatelessWidget {
               color: frameCount == 0
                   ? Colors.white24
                   : autoMode
-                      ? const Color(0xFFEF4444) // red = recording
+                      ? const Color(0xFFEF4444)
                       : const Color(0xFF1A73E8),
               borderRadius: BorderRadius.circular(20),
             ),
@@ -422,7 +621,9 @@ class _TopBar extends StatelessWidget {
               mainAxisSize: MainAxisSize.min,
               children: [
                 Icon(
-                  autoMode ? Icons.fiber_manual_record : Icons.photo_library_outlined,
+                  autoMode
+                      ? Icons.fiber_manual_record
+                      : Icons.photo_library_outlined,
                   color: Colors.white,
                   size: 13,
                 ),
@@ -473,17 +674,17 @@ class _BottomControls extends StatelessWidget {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          DotGuideWidget(totalDots: 7),
-
           // Main controls row
           Padding(
-            padding: const EdgeInsets.fromLTRB(20, 4, 20, 10),
+            padding: const EdgeInsets.fromLTRB(20, 12, 20, 10),
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
                 // Auto toggle
                 _ControlButton(
-                  icon: autoMode ? Icons.stop_rounded : Icons.play_arrow_rounded,
+                  icon: autoMode
+                      ? Icons.stop_rounded
+                      : Icons.play_arrow_rounded,
                   label: autoMode ? 'Stop' : 'Auto',
                   color: autoMode
                       ? const Color(0xFFEF4444)
@@ -491,7 +692,7 @@ class _BottomControls extends StatelessWidget {
                   onTap: onToggleAuto,
                 ),
 
-                // Capture button (disabled in auto mode — gyro handles it)
+                // Capture button (disabled in auto mode)
                 GestureDetector(
                   onTap: autoMode ? null : onCapture,
                   child: AnimatedContainer(
@@ -542,36 +743,96 @@ class _BottomControls extends StatelessWidget {
           ),
 
           // Stitch button (full width, appears after 2+ frames)
-          AnimatedCrossFade(
+          AnimatedSize(
             duration: const Duration(milliseconds: 300),
-            crossFadeState: frameCount >= 2
-                ? CrossFadeState.showSecond
-                : CrossFadeState.showFirst,
-            firstChild: const SizedBox(height: 20),
-            secondChild: Padding(
-              padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
-              child: SizedBox(
-                width: double.infinity,
-                child: ElevatedButton.icon(
-                  onPressed: onStitch,
-                  icon: const Icon(Icons.auto_awesome, size: 18),
-                  label: Text(
-                    autoMode
-                        ? 'Stop & Stitch ($frameCount frames)'
-                        : 'Stitch Panorama ($frameCount frames)',
-                  ),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF22C55E),
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(vertical: 14),
-                    textStyle: const TextStyle(
-                        fontWeight: FontWeight.bold, fontSize: 15),
-                    shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(14)),
-                  ),
-                ),
-              ),
-            ),
+            curve: Curves.easeInOut,
+            child: frameCount >= 2
+                ? Padding(
+                    padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+                    child: SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton.icon(
+                        onPressed: onStitch,
+                        icon: const Icon(Icons.auto_awesome, size: 18),
+                        label: Text(
+                          autoMode
+                              ? 'Stop & Stitch  •  $frameCount frames'
+                              : 'Stitch  •  $frameCount frames',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF22C55E),
+                          foregroundColor: Colors.white,
+                          padding:
+                              const EdgeInsets.symmetric(vertical: 14),
+                          textStyle: const TextStyle(
+                              fontWeight: FontWeight.bold, fontSize: 14),
+                          shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(14)),
+                        ),
+                      ),
+                    ),
+                  )
+                : const SizedBox(height: 20),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ── Overlap badge ───────────────────────────────────────────────────────────
+
+class _OverlapBadge extends StatelessWidget {
+  final double percent;
+  const _OverlapBadge({required this.percent});
+
+  @override
+  Widget build(BuildContext context) {
+    final Color color;
+    final String advice;
+    if (percent < 20) {
+      color = const Color(0xFFEF4444); // red — gap, may miss content
+      advice = 'Pan slower';
+    } else if (percent < 35) {
+      color = const Color(0xFFF97316); // orange — borderline
+      advice = 'A little more overlap';
+    } else if (percent <= 70) {
+      color = const Color(0xFF22C55E); // green — ideal
+      advice = 'Good overlap';
+    } else if (percent <= 85) {
+      color = const Color(0xFFF97316); // orange — too much
+      advice = 'Pan a bit faster';
+    } else {
+      color = const Color(0xFFEF4444); // red — near duplicate
+      advice = 'Pan faster';
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.85),
+        borderRadius: BorderRadius.circular(20),
+        boxShadow: [
+          BoxShadow(
+              color: color.withOpacity(0.4), blurRadius: 8, spreadRadius: 1)
+        ],
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            '${percent.round()}% overlap',
+            style: const TextStyle(
+                color: Colors.white,
+                fontSize: 13,
+                fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(width: 6),
+          Text(
+            '· $advice',
+            style: const TextStyle(color: Colors.white70, fontSize: 12),
           ),
         ],
       ),
@@ -610,6 +871,8 @@ class _ControlButton extends StatelessWidget {
           ),
           const SizedBox(height: 4),
           Text(label,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
               style:
                   const TextStyle(color: Colors.white54, fontSize: 11)),
         ],
